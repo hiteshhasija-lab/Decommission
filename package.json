@@ -1,6 +1,6 @@
 {
   "name": "decom-orchestrator",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Standalone server decommission orchestrator: ServiceNow (CMDB, change, approvals), VMware vSphere (ESXi / vCenter) and, later, Microsoft Teams.",
   "private": true,
   "license": "UNLICENSED",

@@ -10,7 +10,7 @@ const { fakeNotifier } = require('../src/adapters/fake/notifier');
 
 test('HTTP API: token required; a chat command starts a run; status answers', async () => {
   const db = await pglite(); await migrate(db);
-  const cfg = load({ DECOM_API_TOKEN: 'secret-token', DATABASE_URL: 'x', DECOM_CONFIRMERS: 'alex' });
+  const cfg = load({ DECOM_API_TOKEN: 'secret-token', DATABASE_URL: 'x', DECOM_CONFIRMERS: 'alex', SN_INSTANCE: 'dev1', SN_USER: 'u', SN_PASSWORD: 'p', VSPHERE_USER: 'u', VSPHERE_PASSWORD: 'p' });
   const engine = createEngine({ db, itsm: fakeItsm(), hypervisor: fakeHypervisor(), notifier: fakeNotifier(), config: cfg, autoKick: false, log: { error() {} } });
   const server = buildApp({ engine, cfg, db }).listen(0);
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -27,6 +27,21 @@ test('HTTP API: token required; a chat command starts a run; status answers', as
     const health = await (await fetch(`${base}/healthz`)).json();
     assert.equal(health.ok, true);
     assert.equal(health.dryRun, true, 'dry run is the default');
+  } finally {
+    server.close();
+  }
+});
+
+test('HTTP API: requests are refused while ServiceNow or vSphere is not configured', async () => {
+  const db = await pglite(); await migrate(db);
+  const cfg = load({ DECOM_API_TOKEN: 'secret-token', DATABASE_URL: 'x' });
+  const engine = createEngine({ db, itsm: fakeItsm(), hypervisor: fakeHypervisor(), notifier: fakeNotifier(), config: cfg, autoKick: false, log: { error() {} } });
+  const server = buildApp({ engine, cfg, db }).listen(0);
+  try {
+    const res = await fetch(`http://127.0.0.1:${server.address().port}/api/requests`, { method: 'POST', headers: { Authorization: 'Bearer secret-token', 'Content-Type': 'application/json' }, body: JSON.stringify({ server: 'WEB-01', actor: 'pat' }) });
+    assert.equal(res.status, 503);
+    assert.match((await res.json()).error, /not configured yet: ServiceNow is not configured/);
+    assert.equal((await db.query('SELECT count(*)::int AS n FROM decom_runs')).rows[0].n, 0);
   } finally {
     server.close();
   }

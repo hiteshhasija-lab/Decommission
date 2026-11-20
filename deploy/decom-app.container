@@ -11,6 +11,8 @@ Image=localhost/decom-orchestrator:current
 Network=decom.network
 EnvironmentFile=/etc/decom/decom.env
 PublishPort=127.0.0.1:8080:8080
+HealthCmd=node -e "fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+HealthInterval=30s
 
 [Service]
 Restart=always

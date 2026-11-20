@@ -60,11 +60,14 @@ test/                   workflow, adapter and API tests (in-memory Postgres via 
 
 ## Install on the orchestrator VM (RHEL 10 with Podman)
 
-From a checkout, as root on the VM:
+From a checkout on your workstation (it copies the committed HEAD over SSH and runs the installer):
 
 ```bash
-bash deploy/install.sh
+bash deploy/push-release.sh root@10.0.0.167
 ```
+
+or, as root on the VM from an unpacked release, `bash deploy/install.sh`. Re-running either upgrades
+the service and keeps the settings and data.
 
 It creates `/etc/decom/decom.env` (root-only) with a generated database password and API token, builds
 the image, installs the systemd units (`decom-postgres`, `decom-app`, nightly `decom-backup.timer`)

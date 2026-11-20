@@ -39,7 +39,16 @@ function buildApp({ engine, cfg, db }) {
     }
   };
 
-  app.post('/api/requests', wrap((req) => engine.request({ server: req.body.server, actor: req.body.actor })));
+  // A request cannot get anywhere until ServiceNow and vSphere are configured: say so instead of
+  // leaving a run that retries for ever.
+  const notReady = () => config.problems(cfg).filter((p) => /ServiceNow|vSphere/.test(p));
+  const startRun = (server, actor) => {
+    const missing = notReady();
+    if (missing.length) throw new DecomError(503, `The orchestrator is not configured yet: ${missing.join('; ')}.`);
+    return engine.request({ server, actor });
+  };
+
+  app.post('/api/requests', wrap((req) => startRun(req.body.server, req.body.actor)));
   app.get('/api/runs', wrap((req) => engine.list({ all: req.query.all === '1' })));
   app.get('/api/status/:query', wrap(async (req) => {
     const s = await engine.status(req.params.query);
@@ -58,7 +67,7 @@ function buildApp({ engine, cfg, db }) {
     const { text, actor } = req.body || {};
     const decom = extractDecomIntent(text);
     if (decom) {
-      const run = await engine.request({ server: decom.hostname, actor });
+      const run = await startRun(decom.hostname, actor);
       return { reply: `Request received: decommission ${decom.hostname} (run ${run.id}). Checking the CMDB and vSphere.`, run };
     }
     const st = extractStatusIntent(text);
