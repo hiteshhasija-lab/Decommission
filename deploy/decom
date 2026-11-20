@@ -1,0 +1,4 @@
+#!/usr/bin/bash
+# The operator command on the orchestrator VM: runs the CLI inside the service container.
+if [ -t 0 ] && [ -t 1 ]; then tty=-t; else tty=; fi
+exec podman exec -i $tty ${DECOM_ACTOR:+-e DECOM_ACTOR="$DECOM_ACTOR"} decom-app node src/cli.js "$@"

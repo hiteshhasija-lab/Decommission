@@ -1,0 +1,18 @@
+# Workflow state only (runs, events, outbox). Not published outside the decom network.
+[Unit]
+Description=Decommission orchestrator database
+
+[Container]
+ContainerName=decom-postgres
+Image=docker.io/library/postgres:16
+Network=decom.network
+Volume=decom-pgdata:/var/lib/postgresql/data
+EnvironmentFile=/etc/decom/postgres.env
+HealthCmd=pg_isready -U decom -d decom
+HealthInterval=15s
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

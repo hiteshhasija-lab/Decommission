@@ -1,0 +1,19 @@
+# The orchestrator. Its API listens on 127.0.0.1:8080 only (the `decom` command); publish it through a
+# reverse proxy when Teams needs to reach it.
+[Unit]
+Description=Decommission orchestrator
+Requires=decom-postgres.service
+After=decom-postgres.service
+
+[Container]
+ContainerName=decom-app
+Image=localhost/decom-orchestrator:current
+Network=decom.network
+EnvironmentFile=/etc/decom/decom.env
+PublishPort=127.0.0.1:8080:8080
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

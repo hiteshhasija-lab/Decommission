@@ -1,0 +1,8 @@
+[Unit]
+Description=Nightly backup of the decommission orchestrator database
+Requires=decom-postgres.service
+After=decom-postgres.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bash -c 'set -o pipefail; mkdir -p /var/lib/decom/backups && podman exec decom-postgres pg_dump -U decom -d decom | gzip > /var/lib/decom/backups/decom-$(date -u +%%Y%%m%%dT%%H%%M%%SZ).sql.gz && find /var/lib/decom/backups -name "decom-*.sql.gz" -mtime +14 -delete'

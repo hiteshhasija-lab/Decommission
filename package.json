@@ -1,0 +1,21 @@
+{
+  "name": "decom-orchestrator",
+  "version": "0.1.0",
+  "description": "Standalone server decommission orchestrator: ServiceNow (CMDB, change, approvals), VMware vSphere (ESXi / vCenter) and, later, Microsoft Teams.",
+  "private": true,
+  "license": "UNLICENSED",
+  "main": "src/server.js",
+  "bin": { "decom": "src/cli.js" },
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test --test-concurrency=1 test/*.test.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.2.17"
+  }
+}
