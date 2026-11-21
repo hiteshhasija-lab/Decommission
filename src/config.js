@@ -17,6 +17,12 @@ function load(env = process.env) {
     soakHours: num(env.DECOM_SOAK_HOURS, 24),
     pollSeconds: num(env.DECOM_POLL_SECONDS, 60),
     shutdownTimeoutSeconds: num(env.DECOM_SHUTDOWN_TIMEOUT_SECONDS, 180),
+    // When a run counts as stuck: a working step (checking, shutting down, deleting...) longer than
+    // stuckMinutes; waiting for approval, pre-checks or the delete confirmation longer than
+    // stuckWaitHours; waiting for a person after a failure longer than stuckAttentionHours.
+    stuckMinutes: num(env.DECOM_STUCK_MINUTES, 30),
+    stuckWaitHours: num(env.DECOM_STUCK_WAIT_HOURS, 72),
+    stuckAttentionHours: num(env.DECOM_STUCK_ATTENTION_HOURS, 24),
     // Never decommissioned, whatever the CMDB says: the orchestrator's own VM first of all.
     neverTouch: [...new Set(['DECOM', ...list(env.DECOM_NEVER_TOUCH)].map((s) => s.toLowerCase()))],
 

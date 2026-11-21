@@ -25,6 +25,8 @@ const FINAL = ['completed', 'rejected', 'cancelled', 'refused'];
 // A failure in a step that changes a VM is never retried automatically: the run is marked for
 // attention and waits for `decom retry`.
 const VM_CHANGING = ['powering_off', 'destroying', 'cancelling'];
+const WORKING = ['validating', 'creating_change', 'powering_off', 'destroying', 'retiring', 'cancelling'];
+const WAITING = ['awaiting_approval', 'prechecks', 'awaiting_destroy_confirm'];
 const CANCELLABLE = ['validating', 'creating_change', 'awaiting_approval', 'prechecks', 'soaking', 'awaiting_destroy_confirm', 'on_hold'];
 const STATE_LABELS = {
   validating: 'Checking the CMDB and vSphere',
@@ -104,6 +106,7 @@ function createEngine({ db, itsm, hypervisor, notifier, config, now = () => new 
   // Compare-and-set on the run's state: only one caller wins a transition, in any number of processes.
   const COLUMNS = new Set(['state', 'ci', 'vm', 'change_sys_id', 'change_number', 'ci_status_before', 'powered_off_at', 'soak_ends_at',
     'destroy_confirmed_by', 'destroy_confirmed_at', 'destroy_issued_at', 'reclaimed', 'attention', 'outcome', 'next_check_at', 'finished_at']);
+  // state_since and attention_at are kept here, from the state and attention fields, never set directly.
   async function update(runId, fields, fromState) {
     const sets = []; const params = [runId];
     for (const [k, v] of Object.entries(fields)) {
@@ -113,7 +116,10 @@ function createEngine({ db, itsm, hypervisor, notifier, config, now = () => new 
       sets.push(`${k} = $${params.length}${json ? '::jsonb' : ''}`);
     }
     params.push(now());
-    sets.push(`updated_at = $${params.length}`);
+    const at = `$${params.length}`;
+    sets.push(`updated_at = ${at}`);
+    if ('state' in fields) sets.push(`state_since = CASE WHEN state IS DISTINCT FROM $${Object.keys(fields).indexOf('state') + 2} THEN ${at} ELSE state_since END`);
+    if ('attention' in fields) sets.push(`attention_at = ${fields.attention ? `COALESCE(attention_at, ${at})` : 'NULL'}`);
     let where = 'id = $1';
     if (fromState) { params.push(fromState); where += ` AND state = $${params.length}`; }
     const { rows } = await db.query(`UPDATE decom_runs SET ${sets.join(', ')} WHERE ${where} RETURNING *`, params);
@@ -511,7 +517,7 @@ function createEngine({ db, itsm, hypervisor, notifier, config, now = () => new 
       started.push(advance(r.id));
     }
     if (wait) await Promise.all(started);
-    if (wait) await deliver();
+    if (wait) { await checkStuck(); await deliver(); }
   }
 
   // Messages go out in order. A message the chat system refuses for good (a 4xx other than 408/429, or
@@ -543,6 +549,45 @@ function createEngine({ db, itsm, hypervisor, notifier, config, now = () => new 
     } finally {
       delivering = false;
     }
+  }
+
+  // ---------- stuck runs ----------
+  const ago = (ms) => formatDuration(ms / 3600000);
+  function stuckReason(run, at = now()) {
+    if (FINAL.includes(run.state)) return null;
+    const since = (d) => at - new Date(d || run.updated_at);
+    if (run.attention) {
+      const ms = since(run.attention_at);
+      return ms > config.stuckAttentionHours * 3600000 ? `has waited for a person for ${ago(ms)}: ${run.attention}` : null;
+    }
+    if (run.state === 'soaking') {
+      const over = at - new Date(run.soak_ends_at);
+      return over > config.stuckMinutes * 60000 ? `its soak period ended ${ago(over)} ago but it has not moved on` : null;
+    }
+    const ms = since(run.state_since);
+    if (WORKING.includes(run.state) && ms > config.stuckMinutes * 60000) return `has been at "${STATE_LABELS[run.state]}" for ${ago(ms)}`;
+    if (WAITING.includes(run.state) && ms > config.stuckWaitHours * 3600000) return `has been at "${STATE_LABELS[run.state]}" for ${ago(ms)}`;
+    return null;
+  }
+
+  async function stuckRuns() {
+    const { rows } = await db.query('SELECT * FROM decom_runs WHERE state <> ALL($1) ORDER BY id', [FINAL]);
+    return rows.map((run) => ({ run, reason: stuckReason(run) })).filter((x) => x.reason);
+  }
+
+  // Says so once for each time a run gets stuck (each state it sits in, each wait for a person): an event
+  // in its history and a chat message. `decom health` and /healthz list them for as long as they last.
+  async function checkStuck() {
+    const stuck = await stuckRuns();
+    for (const { run, reason } of stuck) {
+      const key = `run:${run.id}:stuck:${run.state}:${new Date(run.state_since || 0).getTime()}:${run.attention_at ? new Date(run.attention_at).getTime() : ''}`;
+      await once(key, async () => {
+        await event(run.id, null, 'stuck', `Stuck: ${reason}.`);
+        await notify(run.id, key.slice(`run:${run.id}:`.length), `⏰ Run ${run.id} (${ciLabel(run)}${run.change_number ? `, ${run.change_number}` : ''}) ${reason}. See "decom status ${run.id}".`);
+        return true;
+      });
+    }
+    return stuck;
   }
 
   // ---------- actions (from the CLI, the HTTP API and, later, Teams) ----------
@@ -656,7 +701,7 @@ function createEngine({ db, itsm, hypervisor, notifier, config, now = () => new 
     const { rows } = all
       ? await db.query('SELECT * FROM decom_runs ORDER BY id DESC LIMIT 50')
       : await db.query('SELECT * FROM decom_runs WHERE state <> ALL($1) ORDER BY id', [FINAL]);
-    return rows.map((run) => ({ ...run, label: STATE_LABELS[run.state] || run.state }));
+    return rows.map((run) => ({ ...run, label: STATE_LABELS[run.state] || run.state, stuck: stuckReason(run) }));
   }
 
   async function messages(limit = 50) {
@@ -664,7 +709,7 @@ function createEngine({ db, itsm, hypervisor, notifier, config, now = () => new 
     return rows.reverse();
   }
 
-  return { request, precheck, confirmDestroy, cancel, retry, status, list, messages, advance, tick, deliver, getRun };
+  return { request, precheck, confirmDestroy, cancel, retry, status, list, messages, advance, tick, deliver, getRun, stuckRuns, checkStuck };
 }
 
 module.exports = { createEngine, DecomError, TASKS, MANUAL_TASKS, STATE_LABELS, driftProblems, formatDuration, sizeText };

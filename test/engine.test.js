@@ -441,3 +441,59 @@ test('runs advance side by side: a slow shutdown in one run does not hold up ano
   for (let i = 0; i < 50 && (await engine.getRun(a.id)).state !== 'soaking'; i += 1) await new Promise((r) => setTimeout(r, 20));
   assert.equal((await engine.getRun(a.id)).state, 'soaking');
 });
+
+// ---- stuck-run alert (0.1.5) ----
+
+test('stuck runs: a working step, a long wait, an overdue soak and a long wait for a person, each alerted once', async () => {
+  const ctx = await setup({ DECOM_STUCK_MINUTES: '30', DECOM_STUCK_WAIT_HOURS: '72', DECOM_STUCK_ATTENTION_HOURS: '24' });
+  const { engine, itsm, db } = ctx;
+  const run = await engine.request({ server: 'DECOM-TEST-29', actor: 'pat' });
+  // ServiceNow is down: the run sits in validating
+  itsm.state.failNext.findCis = new Error('ServiceNow did not answer');
+  await engine.advance(run.id);
+  ctx.advanceHours(0.25);
+  assert.equal((await engine.stuckRuns()).length, 0, '15 minutes is not stuck');
+  ctx.advanceHours(0.5);
+  let stuck = await engine.checkStuck();
+  assert.equal(stuck.length, 1);
+  assert.match(stuck[0].reason, /has been at "Checking the CMDB and vSphere" for 45 minutes/);
+  await engine.checkStuck(); // a second check does not repeat the message
+  await engine.deliver();
+  assert.equal(ctx.notifier.sent.filter((m) => /⏰/.test(m.message)).length, 1);
+
+  // moves on, then waits for approval: only stuck after 72 hours
+  await engine.advance(run.id);
+  let r = await engine.getRun(run.id);
+  assert.equal(r.state, 'awaiting_approval');
+  ctx.advanceHours(71);
+  assert.equal((await engine.stuckRuns()).length, 0);
+  ctx.advanceHours(2);
+  assert.match((await engine.stuckRuns())[0].reason, /Waiting for change approval in ServiceNow" for 3 days/);
+  const listed = await engine.list();
+  assert.match(listed[0].stuck, /3 days/);
+
+  // approved, pre-checks done, powered off; then the soak is overdue (the service was down)
+  itsm.approve(r.change_number);
+  await engine.advance(run.id);
+  for (const name of TASKS.slice(0, 3)) itsm.closeTaskByName(r.change_number, name);
+  await engine.advance(run.id);
+  assert.equal((await engine.getRun(run.id)).state, 'soaking');
+  ctx.advanceHours(25);
+  assert.match((await engine.stuckRuns())[0].reason, /soak period ended 1 hour ago/);
+
+  // a failed step waits for a person: stuck after 24 hours
+  await db.query(`UPDATE decom_runs SET state = 'awaiting_destroy_confirm' WHERE id = $1`, [run.id]);
+  await engine.confirmDestroy({ runId: run.id, actor: 'alex' });
+  ctx.hv.state.failNext.destroy = new Error('vSphere said no');
+  ctx.hv.state.vms[0].powerState = 'poweredOff';
+  await engine.advance(run.id);
+  r = await engine.getRun(run.id);
+  assert.match(r.attention, /vSphere said no/);
+  ctx.advanceHours(23);
+  assert.equal((await engine.stuckRuns()).length, 0);
+  ctx.advanceHours(2);
+  stuck = await engine.checkStuck();
+  assert.match(stuck[0].reason, /has waited for a person for 25 hours: Deleting the VM failed: vSphere said no/);
+  await engine.deliver();
+  assert.equal(ctx.notifier.sent.filter((m) => /⏰/.test(m.message)).length, 2);
+});

@@ -49,7 +49,7 @@ async function call(cfg, method, path, body) {
 const t = (d) => (d ? new Date(d).toISOString().slice(0, 16).replace('T', ' ') : '');
 function row(r) {
   const name = r.ci ? r.ci.name : r.server;
-  return `${String(r.id).padStart(4)}  ${name.padEnd(20)} ${(r.change_number || '').padEnd(11)} ${r.label}${r.attention ? `  ⚠ ${r.attention}` : ''}`;
+  return `${String(r.id).padStart(4)}  ${name.padEnd(20)} ${(r.change_number || '').padEnd(11)} ${r.label}${r.attention ? `  ⚠ ${r.attention}` : ''}${r.stuck && !r.attention ? `  ⏰ ${r.stuck}` : ''}`;
 }
 
 async function main() {
@@ -125,6 +125,10 @@ async function main() {
       const h = await res.json();
       console.log(`Service ${h.version}: ${h.ok ? 'running, database OK' : 'database NOT reachable'}. Dry run: ${h.dryRun ? 'ON (VMs are never deleted)' : 'off'}. Soak: ${h.soakHours} h. Notifier: ${h.notifier}.`);
       for (const p of h.problems) console.log(`  - ${p}`);
+      if (h.stuck && h.stuck.length) {
+        console.log('Stuck runs:');
+        for (const s of h.stuck) console.log(`  ⏰ run ${s.id} (${s.server}) ${s.reason}`);
+      }
       break;
     }
     case 'check': {

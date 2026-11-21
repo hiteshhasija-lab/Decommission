@@ -30,6 +30,7 @@ podman build -q -t "localhost/decom-orchestrator:${version}" -t localhost/decom-
 install -m 644 deploy/decom.network deploy/decom-postgres.container deploy/decom-app.container /etc/containers/systemd/
 install -m 644 deploy/decom-backup.service deploy/decom-backup.timer /etc/systemd/system/
 install -m 755 deploy/decom /usr/local/bin/decom
+install -m 755 deploy/restore-test.sh /usr/local/sbin/decom-restore-test
 systemctl daemon-reload
 systemctl start decom-postgres.service
 systemctl restart decom-app.service

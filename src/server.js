@@ -24,7 +24,11 @@ function buildApp({ engine, cfg, db }) {
     let dbOk = false;
     try { await db.query('SELECT 1'); dbOk = true; } catch { /* reported below */ }
     const problems = config.problems(cfg);
-    res.status(dbOk ? 200 : 503).json({ ok: dbOk, version, dryRun: cfg.dryRun, soakHours: cfg.soakHours, notifier: cfg.notifier, problems });
+    // Stuck runs are reported, not a failed health check: the service itself is fine and a restart
+    // would not help. A monitoring tool can alert on `stuck` being non-empty.
+    let stuck = [];
+    if (dbOk) stuck = (await engine.stuckRuns().catch(() => [])).map(({ run, reason }) => ({ id: run.id, server: run.ci ? run.ci.name : run.server, state: run.state, reason }));
+    res.status(dbOk ? 200 : 503).json({ ok: dbOk, version, dryRun: cfg.dryRun, soakHours: cfg.soakHours, notifier: cfg.notifier, problems, stuck });
   });
 
   app.use('/api', (req, res, next) => (tokenOk(req.get('authorization'), cfg.apiToken) ? next() : res.status(401).json({ error: 'Missing or wrong API token.' })));
@@ -101,6 +105,7 @@ async function main() {
   setTimeout(tick, 3000); // resume interrupted runs shortly after a start
   setInterval(tick, 15000); // cheap: it only picks runs whose timer is due
   setInterval(deliver, 5000);
+  setInterval(() => engine.checkStuck().catch((e) => console.error('stuck check failed:', e.message)), 5 * 60000);
 
   const server = buildApp({ engine, cfg, db }).listen(cfg.port, () => console.log(`listening on :${cfg.port}`));
   const stop = () => { server.close(); db.close().finally(() => process.exit(0)); };

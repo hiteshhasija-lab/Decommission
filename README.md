@@ -81,6 +81,17 @@ connections without changing anything.
 - CIs in `cmdb_ci_vmware_instance` (name, IP address, VM instance UUID) related to a
   `cmdb_ci_esx_server` CI with the host's IP address (any relationship type, either direction).
 
+## Monitoring and backups
+
+- `decom health` (and `GET /healthz`, field `stuck`) lists runs that are stuck: a working step longer
+  than `DECOM_STUCK_MINUTES` (30), waiting for approval, pre-checks or the delete confirmation longer
+  than `DECOM_STUCK_WAIT_HOURS` (72), a soak period that ended without the run moving on, or waiting for
+  a person after a failure longer than `DECOM_STUCK_ATTENTION_HOURS` (24). Each stuck run also gets one
+  chat message and an entry in its history.
+- `decom-backup.timer` dumps the database nightly at 02:30 to `/var/lib/decom/backups` (14 days kept).
+  `decom-restore-test` restores the newest dump into a throwaway container and compares it with the
+  live database.
+
 ## Tests
 
 ```bash
