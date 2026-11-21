@@ -86,3 +86,11 @@ connections without changing anything.
 ```bash
 npm ci && npm test
 ```
+
+Contract test of the vSphere adapter against a real host, on a disposable `DECOM-TEST-<n>` VM (shut
+down, repeat shutdown is a no-op, power on; with `--delete`, then delete and verify it is gone). Run on
+the orchestrator VM:
+
+```bash
+podman exec -i decom-app node - 10.0.0.65 DECOM-TEST-31 < contract/vsphere.js
+```
