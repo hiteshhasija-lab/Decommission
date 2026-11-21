@@ -14,7 +14,12 @@ function teamsWorkflowNotifier(url, { fetchImpl = fetch } = {}) {
         body: JSON.stringify({ text: message, runId, ...(data || {}) }),
         signal: AbortSignal.timeout(15000),
       });
-      if (!res.ok) throw new Error(`Teams workflow answered HTTP ${res.status}`);
+      if (!res.ok) {
+        const e = new Error(`Teams workflow answered HTTP ${res.status}`);
+        // A 4xx will not change by retrying (except timeouts and rate limits): set the message aside.
+        e.permanent = res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429;
+        throw e;
+      }
     },
   };
 }

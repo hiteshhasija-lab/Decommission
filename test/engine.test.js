@@ -289,3 +289,155 @@ test('a change cancelled in ServiceNow during pre-checks puts the CI back', asyn
   assert.equal((await engine.getRun(run.id)).state, 'cancelled');
   assert.equal(itsm.state.cis[0].status, 'installed');
 });
+
+// ---- review fixes (0.1.4) ----
+
+test('dry run is fixed when the run is requested: turning it off later still deletes nothing', async () => {
+  const ctx = await setup({ DECOM_DRY_RUN: 'true' });
+  const r = await toConfirm(ctx);
+  assert.equal(r.dry_run, true);
+  ctx.config.dryRun = false; // the operator changes the setting mid-run
+  await ctx.engine.confirmDestroy({ runId: r.id, actor: 'alex' });
+  await ctx.engine.advance(r.id);
+  const done = await ctx.engine.getRun(r.id);
+  assert.match(done.outcome, /Dry run/);
+  assert.equal(ctx.hv.state.vms.length, 1, 'VM not deleted');
+  assert.equal(ctx.itsm.state.cis[0].status, 'installed', 'CI not retired');
+  // and the reverse: a real run stays real when dry run is switched on
+  const ctx2 = await setup({ DECOM_DRY_RUN: 'false' });
+  const r2 = await toConfirm(ctx2);
+  ctx2.config.dryRun = true;
+  await ctx2.engine.confirmDestroy({ runId: r2.id, actor: 'alex' });
+  await ctx2.engine.advance(r2.id);
+  assert.equal(ctx2.hv.state.vms.length, 0, 'VM deleted');
+  assert.equal(ctx2.itsm.state.cis[0].status, 'retired');
+});
+
+test('a VM that was off before the decommission is never powered on by cancel, dry run or an incident', async () => {
+  for (const ending of ['cancel', 'dry run', 'incident']) {
+    const ctx = await setup({ DECOM_DRY_RUN: ending === 'dry run' ? 'true' : 'false' });
+    ctx.hv.state.vms[0].powerState = 'poweredOff';
+    const { engine, itsm, hv } = ctx;
+    const run = await engine.request({ server: 'DECOM-TEST-29', actor: 'pat' });
+    await engine.advance(run.id);
+    itsm.approve((await engine.getRun(run.id)).change_number);
+    await engine.advance(run.id);
+    for (const name of TASKS.slice(0, 3)) itsm.closeTaskByName((await engine.getRun(run.id)).change_number, name);
+    await engine.advance(run.id);
+    assert.equal(hv.state.calls.filter((c) => c.name === 'shutdown').length, 0, 'already off: no shutdown sent');
+    if (ending === 'incident') {
+      itsm.addIncident('ci29', 'INC0010077', new Date(ctx.clock.t.getTime() + 1000));
+      ctx.advanceHours(1);
+      await engine.advance(run.id);
+      const held = await engine.getRun(run.id);
+      assert.equal(held.state, 'on_hold');
+      assert.match(held.attention, /left off, as it was off before/);
+    } else if (ending === 'cancel') {
+      await engine.cancel({ runId: run.id, actor: 'pat' });
+      await engine.advance(run.id);
+      assert.match((await engine.getRun(run.id)).outcome, /left off/);
+    } else {
+      ctx.advanceHours(25);
+      await engine.advance(run.id);
+      await engine.confirmDestroy({ runId: run.id, actor: 'alex' });
+      await engine.advance(run.id);
+      assert.equal((await engine.getRun(run.id)).state, 'completed');
+    }
+    assert.equal(hv.state.vms[0].powerState, 'poweredOff', `${ending}: still off`);
+    assert.equal(hv.state.calls.filter((c) => c.name === 'powerOn').length, 0, `${ending}: no power-on`);
+  }
+});
+
+test('a cancel that races with change creation still cancels the change in ServiceNow', async () => {
+  const ctx = await setup();
+  ctx.itsm.state.loseCreateAnswer = true; // the change is made, but the run never hears its number
+  const run = await ctx.engine.request({ server: 'DECOM-TEST-29', actor: 'pat' });
+  await ctx.engine.advance(run.id);
+  assert.equal((await ctx.engine.getRun(run.id)).state, 'creating_change');
+  assert.equal(ctx.itsm.state.changes.length, 1);
+  await ctx.engine.cancel({ runId: run.id, actor: 'pat' });
+  await ctx.engine.advance(run.id);
+  const r = await ctx.engine.getRun(run.id);
+  assert.equal(r.state, 'cancelled');
+  assert.equal(ctx.itsm.state.changes[0].status, 'cancelled');
+  assert.equal(r.change_number, ctx.itsm.state.changes[0].number);
+});
+
+test('a message the chat system refuses for good is set aside and the rest still go out', async () => {
+  const ctx = await setup();
+  await ctx.engine.request({ server: 'DECOM-TEST-29', actor: 'pat' });
+  await ctx.engine.advance(1);
+  let first = true;
+  ctx.notifier.send = async (msg) => {
+    if (first) { first = false; throw Object.assign(new Error('HTTP 400'), { permanent: true }); }
+    ctx.notifier.sent.push(msg);
+  };
+  await ctx.engine.deliver();
+  const rows = (await ctx.db.query('SELECT status FROM outbox ORDER BY id')).rows.map((x) => x.status);
+  assert.deepEqual(rows, ['failed', 'sent']);
+  const { events } = await ctx.engine.status('1');
+  assert.ok(events.some((e) => /could not be delivered and was set aside/.test(e.message)));
+});
+
+test('a message that keeps failing is set aside after ten attempts', async () => {
+  const ctx = await setup();
+  await ctx.engine.request({ server: 'DECOM-TEST-29', actor: 'pat' });
+  ctx.notifier.failTimes(10);
+  for (let i = 0; i < 10; i += 1) { await ctx.engine.deliver(); ctx.advanceHours(1); }
+  const rows = (await ctx.db.query('SELECT status, attempts FROM outbox ORDER BY id')).rows;
+  assert.equal(rows[0].status, 'failed');
+  assert.equal(rows[0].attempts, 10);
+});
+
+test('a lookup error that retrying cannot fix refuses the request instead of retrying for ever', async () => {
+  const ctx = await setup();
+  ctx.hv.state.failNext.findVm = Object.assign(new Error('refusing to look up an unusual VM name: "APP 01 (old)"'), { refuse: true });
+  const run = await ctx.engine.request({ server: 'DECOM-TEST-29', actor: 'pat' });
+  await ctx.engine.advance(run.id);
+  const r = await ctx.engine.getRun(run.id);
+  assert.equal(r.state, 'refused');
+  assert.match(r.outcome, /unusual VM name/);
+  await ctx.engine.request({ server: 'DECOM-TEST-29', actor: 'pat' }); // the server is free again
+});
+
+test('a CI with an empty status gets it back on cancel', async () => {
+  const ctx = await setup();
+  ctx.itsm.state.cis[0].status = '';
+  const { engine, itsm } = ctx;
+  const run = await engine.request({ server: 'DECOM-TEST-29', actor: 'pat' });
+  await engine.advance(run.id);
+  itsm.approve((await engine.getRun(run.id)).change_number);
+  await engine.advance(run.id);
+  assert.equal(itsm.state.cis[0].status, 'in_maintenance');
+  await engine.cancel({ runId: run.id, actor: 'pat' });
+  await engine.advance(run.id);
+  assert.equal(itsm.state.cis[0].status, '');
+});
+
+test('runs advance side by side: a slow shutdown in one run does not hold up another', async () => {
+  const ctx = await setup();
+  const { engine, itsm, hv } = ctx;
+  itsm.addCi({ sysId: 'ci31', name: 'DECOM-TEST-31', uuid: 'uuid-31' }, HOST);
+  hv.addVm({ name: 'DECOM-TEST-31', uuid: 'uuid-31', host: HOST.ip });
+  const a = await engine.request({ server: 'DECOM-TEST-29', actor: 'pat' });
+  const b = await engine.request({ server: 'DECOM-TEST-31', actor: 'pat' });
+  await engine.tick();
+  itsm.approve((await engine.getRun(a.id)).change_number);
+  await engine.tick();
+  for (const name of TASKS.slice(0, 3)) itsm.closeTaskByName((await engine.getRun(a.id)).change_number, name);
+  let release;
+  hv.state.shutdownGate = new Promise((r) => { release = r; });
+  ctx.advanceHours(0.1);
+  await engine.tick({ wait: false }); // run A starts its shutdown and waits on the slow guest
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal((await engine.getRun(a.id)).state, 'powering_off');
+  itsm.approve((await engine.getRun(b.id)).change_number);
+  ctx.advanceHours(0.1);
+  await engine.tick({ wait: false }); // run B moves on meanwhile
+  for (let i = 0; i < 50 && (await engine.getRun(b.id)).state !== 'prechecks'; i += 1) await new Promise((r) => setTimeout(r, 20));
+  assert.equal((await engine.getRun(b.id)).state, 'prechecks');
+  assert.equal((await engine.getRun(a.id)).state, 'powering_off', 'A is still waiting for its guest');
+  release();
+  for (let i = 0; i < 50 && (await engine.getRun(a.id)).state !== 'soaking'; i += 1) await new Promise((r) => setTimeout(r, 20));
+  assert.equal((await engine.getRun(a.id)).state, 'soaking');
+});

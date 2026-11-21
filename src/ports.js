@@ -8,6 +8,7 @@
 //   createChange({ correlationId, ci, requester, taskNames, start, end })
 //                                          -> { sysId, number, approvalRequested, note }
 //                                             (must return the existing change for a correlationId it has seen)
+//   findChange(correlationId)              -> { sysId, number } | null
 //   getChange(sysId)                       -> { number, status: pending|approved|rejected|cancelled|closed }
 //   listTasks(changeSysId)                 -> [{ sysId, number, name, status: open|done|skipped }]
 //   closeTask(taskSysId, outcome, note)    outcome: done | skipped
@@ -20,12 +21,14 @@
 //   Ci = { sysId, name, ip, uuid, status, className, size: { cpu, memoryMb, diskGb } }
 //
 // Hypervisor (vSphere: standalone ESXi or vCenter):
-//   findVm({ host, name, uuid })           -> Vm | null; throws if more than one VM matches
+//   findVm({ host, name, uuid })           -> Vm | null; throws if more than one VM matches. Errors that will
+//                                             not go away by retrying (ambiguous, unusable name) carry .refuse = true
 //   shutdown(vm, { host, timeoutSeconds }) -> 'already_off' | 'graceful' | 'hard'   (verified off)
 //   powerOn(vm, { host })
 //   destroy(vm, { host })                  (verified gone)
 //   Vm = { ref, name, uuid, instanceUuid, ip, powerState: poweredOn|poweredOff|suspended, size: { cpu, memoryMb, diskGb } }
 //
 // Notifier (Teams later; the console notifier keeps messages for `decom log`):
-//   send({ runId, key, message, data })    throws on failure; the outbox retries
+//   send({ runId, key, message, data })    throws on failure; the outbox retries, unless the error has
+//                                             .permanent = true (then the message is set aside)
 module.exports = {};

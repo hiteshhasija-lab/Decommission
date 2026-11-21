@@ -94,14 +94,13 @@ async function main() {
   console.log(`decom-orchestrator ${version} starting. Dry run: ${cfg.dryRun}. Soak: ${cfg.soakHours} h. Notifier: ${cfg.notifier}.`);
   for (const p of problems) console.warn(`[config] ${p}`);
 
-  let ticking = false;
-  const tick = async () => {
-    if (ticking) return;
-    ticking = true;
-    try { await engine.tick(); } catch (e) { console.error('tick failed:', e.message); } finally { ticking = false; }
-  };
+  // Runs advance in the background, side by side; messages are delivered on their own timer so a long
+  // VM step never holds them up.
+  const tick = () => engine.tick({ wait: false }).catch((e) => console.error('tick failed:', e.message));
+  const deliver = () => engine.deliver().catch((e) => console.error('delivery failed:', e.message));
   setTimeout(tick, 3000); // resume interrupted runs shortly after a start
   setInterval(tick, 15000); // cheap: it only picks runs whose timer is due
+  setInterval(deliver, 5000);
 
   const server = buildApp({ engine, cfg, db }).listen(cfg.port, () => console.log(`listening on :${cfg.port}`));
   const stop = () => { server.close(); db.close().finally(() => process.exit(0)); };

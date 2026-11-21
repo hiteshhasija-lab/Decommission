@@ -53,6 +53,11 @@ function fakeItsm() {
       if (s.loseCreateAnswer) { s.loseCreateAnswer = false; throw new Error('socket hang up'); }
       return { sysId: change.sysId, number: change.number, approvalRequested: true };
     },
+    async findChange(correlationId) {
+      call('findChange', [correlationId]);
+      const c = s.changes.find((x) => x.correlationId === correlationId);
+      return c ? { sysId: c.sysId, number: c.number } : null;
+    },
     async getChange(sysId) {
       call('getChange', [sysId]);
       const c = s.changes.find((x) => x.sysId === sysId);

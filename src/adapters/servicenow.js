@@ -164,6 +164,12 @@ function createServiceNow(cfg, { fetchImpl = fetch } = {}) {
     return { sysId, number, approvalRequested, note };
   }
 
+  // The change a run created, found by its correlation ID (for a cancel that raced with its creation).
+  async function findChange(correlationId) {
+    const rows = await table('change_request', { sysparm_query: `correlation_id=${q(correlationId)}`, sysparm_fields: 'sys_id,number', sysparm_limit: '1' });
+    return rows[0] ? { sysId: rows[0].sys_id, number: rows[0].number } : null;
+  }
+
   async function getChange(sysId) {
     const rows = await table('change_request', { sysparm_query: `sys_id=${sysId}`, sysparm_fields: 'number,state,approval,active' });
     const c = rows[0];
@@ -213,11 +219,12 @@ function createServiceNow(cfg, { fetchImpl = fetch } = {}) {
 
   async function getCiStatus(ci) {
     const rows = await table('cmdb_ci', { sysparm_query: `sys_id=${ci.sysId}`, sysparm_fields: 'install_status' });
-    return rows[0] ? INSTALL_STATUS[rows[0].install_status] || String(rows[0].install_status) : null;
+    // An empty install_status comes back as '' (a status to restore), a missing CI as null.
+    return rows[0] ? INSTALL_STATUS[rows[0].install_status] || String(rows[0].install_status ?? '') : null;
   }
 
   async function setCiStatus(ci, status) {
-    const code = INSTALL_CODE[status] || status;
+    const code = INSTALL_CODE[status] ?? status;
     const body = { install_status: code };
     if (status === 'retired') body.operational_status = '6'; // Retired
     await patch(ci.className || 'cmdb_ci', ci.sysId, body);
@@ -237,7 +244,7 @@ function createServiceNow(cfg, { fetchImpl = fetch } = {}) {
     return { user: me[0] ? me[0].user_name : sn.user, timeZone: me[0] ? me[0].time_zone || '(system default)' : 'unknown', canReadCis: Array.isArray(cis), canReadChanges: Array.isArray(chg) };
   }
 
-  return { findCis, findHost, openWork, createChange, getChange, listTasks, closeTask, setChangeState, addWorkNote, getCiStatus, setCiStatus, incidentsSince, changeLink, check };
+  return { findCis, findHost, openWork, createChange, findChange, getChange, listTasks, closeTask, setChangeState, addWorkNote, getCiStatus, setCiStatus, incidentsSince, changeLink, check };
 }
 
 module.exports = { createServiceNow, ServiceNowError, INSTALL_STATUS, CHANGE_STATE, TASK_STATE };

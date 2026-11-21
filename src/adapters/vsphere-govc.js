@@ -11,14 +11,24 @@ const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9._ -]{0,79}$/;
 function createVsphere(cfg, { exec = execFile } = {}) {
   const v = cfg.vsphere;
 
+  const refusal = (message) => Object.assign(new Error(message), { refuse: true });
+
+  // The host the CMDB names for the VM must be on VSPHERE_ALLOWED_HOSTS when that list is set, in
+  // both modes (through vCenter too, so the list limits what can be touched).
+  function checkHost(host) {
+    if (!v.allowedHosts.length) return;
+    if (!host || !host.ip) throw refusal('VSPHERE_ALLOWED_HOSTS is set, but the CMDB gives no IP address for the VM\'s host.');
+    if (!v.allowedHosts.includes(host.ip)) throw refusal(`Host ${host.ip} is not in VSPHERE_ALLOWED_HOSTS.`);
+  }
+
   function urlFor(host) {
     if (v.mode === 'vcenter') return v.url.replace(/\/+$/, '').replace(/(\/sdk)?$/, '/sdk');
-    if (!host || !host.ip) throw new Error('The CMDB gives no IP address for the VM\'s host.');
-    if (v.allowedHosts.length && !v.allowedHosts.includes(host.ip)) throw new Error(`Host ${host.ip} is not in VSPHERE_ALLOWED_HOSTS.`);
+    if (!host || !host.ip) throw refusal('The CMDB gives no IP address for the VM\'s host.');
     return `https://${host.ip}/sdk`;
   }
 
-  function govc(host, args, timeoutMs = 30000) {
+  function govc(host, args, timeoutMs = 30000, { hostCheck = true } = {}) {
+    if (hostCheck) checkHost(host);
     const env = {
       PATH: process.env.PATH,
       HOME: process.env.HOME || '/tmp',
@@ -81,16 +91,16 @@ function createVsphere(cfg, { exec = execFile } = {}) {
         const raw = (pick(out, 'virtualMachines', 'VirtualMachines') || [])[0];
         if (raw) {
           const name2 = pick(pick(raw, 'config', 'Config') || {}, 'name', 'Name');
-          const paths = await findPaths(host, name2);
+          const paths = SAFE_NAME.test(String(name2 || '')) ? await findPaths(host, name2) : [];
           if (paths.length === 1) return toVm(paths[0], raw);
         }
       } catch (e) {
         if (!/not found|no such vm/i.test(e.message)) throw e;
       }
     }
-    if (!SAFE_NAME.test(String(name || ''))) throw new Error(`Refusing to look up an unusual VM name: ${JSON.stringify(name)}`);
+    if (!SAFE_NAME.test(String(name || ''))) throw refusal(`refusing to look up an unusual VM name: ${JSON.stringify(name)}`);
     const paths = await findPaths(host, name);
-    if (paths.length > 1) throw new Error(`more than one VM is named ${name} (${paths.join(', ')})`);
+    if (paths.length > 1) throw refusal(`more than one VM is named ${name} (${paths.join(', ')})`);
     if (!paths.length) return null;
     return info(host, paths[0]);
   }
@@ -120,10 +130,18 @@ function createVsphere(cfg, { exec = execFile } = {}) {
     if (current.powerState === 'poweredOff') return 'already_off';
     let how = 'hard';
     if (current.toolsRunning) {
-      await govc(host, ['vm.power', '-s', vm.ref], 60000);
-      if (await waitFor(host, vm, 'poweredOff', timeoutSeconds)) how = 'graceful';
+      // A guest that cannot take the shutdown request (Tools hung, operation refused) gets the hard
+      // power-off below instead of stopping the whole step.
+      let asked = true;
+      try { await govc(host, ['vm.power', '-s', vm.ref], 60000); } catch { asked = false; }
+      if (asked && (await waitFor(host, vm, 'poweredOff', timeoutSeconds))) how = 'graceful';
     }
-    if (how === 'hard') await govc(host, ['vm.power', '-off', vm.ref], 120000);
+    if (how === 'hard') {
+      // It may have gone off by itself after the wait ended: powering off an off VM is an error.
+      const still = await info(host, vm.ref);
+      if (still && still.powerState === 'poweredOff') how = current.toolsRunning ? 'graceful' : 'already_off';
+      else await govc(host, ['vm.power', '-off', vm.ref], 120000);
+    }
     if (!(await waitFor(host, vm, 'poweredOff', 60))) throw new Error(`${vm.name} is still not powered off.`);
     return how;
   }
@@ -142,8 +160,8 @@ function createVsphere(cfg, { exec = execFile } = {}) {
   // Read-only connection check for `decom check`. `about` answers without a login, so the VM count
   // (which needs one) is what proves the credentials work.
   async function about(host) {
-    const name = (await govc(host, ['about'])).split('\n')[0].replace(/^FullName:\s*/, '').trim();
-    const vms = (await govc(host, ['find', '/', '-type', 'm'])).split('\n').filter(Boolean).length;
+    const name = (await govc(host, ['about'], 30000, { hostCheck: false })).split('\n')[0].replace(/^FullName:\s*/, '').trim();
+    const vms = (await govc(host, ['find', '/', '-type', 'm'], 30000, { hostCheck: false })).split('\n').filter(Boolean).length;
     return `${name}; logged in, ${vms} VM${vms === 1 ? '' : 's'} visible`;
   }
 

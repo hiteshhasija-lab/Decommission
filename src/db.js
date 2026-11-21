@@ -19,7 +19,9 @@ async function migrate(db) {
 // node-postgres. `exec` runs a multi-statement script (migrations).
 function postgres(url) {
   const { Pool } = require('pg');
-  const pool = new Pool({ connectionString: url, max: 5 });
+  // Each run being advanced holds one connection for its lock and needs others for its queries; the
+  // engine advances at most 4 runs at once.
+  const pool = new Pool({ connectionString: url, max: 12 });
   return {
     query: (text, params) => pool.query(text, params),
     exec: (text) => pool.query(text),

@@ -134,3 +134,47 @@ test('vSphere: the connection check proves the login with a VM count', async () 
   const bad = fakeExec({ about: 'FullName: x\n', find: new Error('ServerFaultCode: Cannot complete login due to an incorrect user name or password.') });
   await assert.rejects(createVsphere(cfg, { exec: bad }).about({ ip: '10.0.0.65' }), /incorrect user name or password/);
 });
+
+// ---- review fixes (0.1.4) ----
+
+test('vSphere: a guest that cannot take the shutdown request is powered off hard instead', async () => {
+  let power = 'poweredOn';
+  const info = () => JSON.stringify({ virtualMachines: [{ config: { name: 'X-1', hardware: {} }, runtime: { powerState: power }, guest: { toolsRunningStatus: 'guestToolsRunning' } }] });
+  const exec = fakeExec({
+    'vm.info': info,
+    'vm.power': (args) => { if (args[1] === '-s') return new Error('ToolsUnavailable'); power = 'poweredOff'; return ''; },
+  });
+  const how = await createVsphere(cfg, { exec }).shutdown({ ref: '/dc/vm/X-1', name: 'X-1' }, { host: { ip: '10.0.0.65' }, timeoutSeconds: 1 });
+  assert.equal(how, 'hard');
+  assert.deepEqual(exec.calls.filter((c) => c.args[0] === 'vm.power').map((c) => c.args[1]), ['-s', '-off']);
+});
+
+test('vSphere: VSPHERE_ALLOWED_HOSTS also limits what vCenter mode may touch; unusual names are refusals', async () => {
+  const c = load({ VSPHERE_MODE: 'vcenter', VSPHERE_URL: 'https://vc.example', VSPHERE_USER: 'u', VSPHERE_PASSWORD: 'p', VSPHERE_ALLOWED_HOSTS: '10.0.0.65' });
+  const exec = fakeExec({ find: '/dc/vm/X\n', 'vm.info': VMINFO });
+  const vs = createVsphere(c, { exec });
+  await assert.rejects(vs.findVm({ host: { ip: '10.0.0.66' }, name: 'X' }), (e) => e.refuse && /not in VSPHERE_ALLOWED_HOSTS/.test(e.message));
+  await assert.rejects(vs.findVm({ host: { name: 'esx-no-ip' }, name: 'X' }), /no IP address/);
+  assert.equal(exec.calls.length, 0, 'nothing reached vCenter');
+  await vs.findVm({ host: { ip: '10.0.0.65' }, name: 'DECOM-TEST-29' });
+  assert.equal(exec.calls[0].env.GOVC_URL, 'https://vc.example/sdk');
+  await assert.rejects(vs.findVm({ host: { ip: '10.0.0.65' }, name: 'APP 01 (old)' }), (e) => e.refuse === true);
+});
+
+test('Teams workflow: a 4xx is permanent, a 429 or 5xx is retried', async () => {
+  const { teamsWorkflowNotifier } = require('../src/adapters/notifiers');
+  for (const [status, permanent] of [[400, true], [404, true], [429, false], [503, false]]) {
+    const n = teamsWorkflowNotifier('https://example/hook', { fetchImpl: async () => ({ ok: false, status }) });
+    await assert.rejects(n.send({ runId: 1, message: 'x' }), (e) => e.permanent === permanent);
+  }
+});
+
+test('ServiceNow: findChange by correlation ID; an empty CI status reads as ""', async () => {
+  const f = fakeFetch({
+    'GET /api/now/table/change_request': () => [200, { result: [{ sys_id: 's7', number: 'CHG0030007' }] }],
+    'GET /api/now/table/cmdb_ci': () => [200, { result: [{ install_status: '' }] }],
+  });
+  const sn = createServiceNow(cfg, { fetchImpl: f });
+  assert.deepEqual(await sn.findChange('decom-orchestrator-run-3'), { sysId: 's7', number: 'CHG0030007' });
+  assert.equal(await sn.getCiStatus({ sysId: 'c' }), '');
+});

@@ -24,6 +24,7 @@ function fakeHypervisor() {
     },
     async shutdown(vm) {
       call('shutdown', vm);
+      if (s.shutdownGate) await s.shutdownGate; // a slow guest: the test releases it
       const v = find(vm);
       if (v.powerState === 'poweredOff') return 'already_off';
       v.powerState = 'poweredOff';

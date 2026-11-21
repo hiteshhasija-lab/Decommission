@@ -138,6 +138,8 @@ function createEngine({ db, itsm, hypervisor, notifier, config, now = () => new 
     return result;
   }
 
+  // '' is a real "before" status (an empty install_status), only null means none was recorded.
+  const hasStatusBefore = (run) => run.ci_status_before !== null && run.ci_status_before !== undefined;
   const later = (seconds = config.pollSeconds) => new Date(now().getTime() + seconds * 1000);
   const isNeverTouch = (name) => config.neverTouch.includes(String(name || '').toLowerCase());
   const ciLabel = (run) => (run.ci && run.ci.name) || run.server;
@@ -199,7 +201,7 @@ function createEngine({ db, itsm, hypervisor, notifier, config, now = () => new 
       try {
         vm = await hypervisor.findVm({ host, name: ci.name, uuid: ci.uuid });
       } catch (e) {
-        if (/more than one/i.test(e.message)) return refuse(e.message);
+        if (e.refuse || /more than one/i.test(e.message)) return refuse(e.message);
         throw e;
       }
       if (!vm) return refuse(`no VM named ${ci.name} was found on ${host.name}`);
@@ -224,7 +226,7 @@ function createEngine({ db, itsm, hypervisor, notifier, config, now = () => new 
       await workNoteOnce(updated, 'created',
         `Created by the decommission orchestrator (run ${run.id}) for ${run.requested_by}. VM ${run.ci.name} on ${run.ci.host.name}` +
         ` (${run.vm.powerState}, ${sizeText(run.vm.size)}). Soak period after power-off: ${formatDuration(config.soakHours)}.` +
-        (config.dryRun ? ' DRY RUN: the VM will not be deleted.' : ''));
+        (run.dry_run ? ' DRY RUN: the VM will not be deleted.' : ''));
       const where = link(updated);
       await notify(run.id, 'change-created', `📝 ${change.number} created to decommission ${run.ci.name}. It needs approval in ServiceNow${where ? `: ${where}` : ''}.` +
         (change.approvalRequested ? '' : ` ${change.note || 'Approval could not be requested automatically; move the change to Assess in ServiceNow.'}`),
@@ -243,9 +245,8 @@ function createEngine({ db, itsm, hypervisor, notifier, config, now = () => new 
       }
       if (await followChange(run, change)) return 'continue';
       // Approved. Maintenance mode first, keeping the status it had so a cancel can put it back.
-      let before = run.ci_status_before;
-      if (!before) {
-        before = await itsm.getCiStatus(run.ci);
+      if (!hasStatusBefore(run)) {
+        const before = (await itsm.getCiStatus(run.ci)) ?? '';
         if (before !== 'in_maintenance') await update(run.id, { ci_status_before: before });
       }
       await itsm.setCiStatus(run.ci, 'in_maintenance');
@@ -325,7 +326,7 @@ function createEngine({ db, itsm, hypervisor, notifier, config, now = () => new 
       await transition(run, 'awaiting_destroy_confirm', { next_check_at: later() }, 'Soak period ended with no incidents.');
       await notify(run.id, `confirm-destroy:${new Date(run.soak_ends_at).getTime()}`, `⏱️ The soak period for ${run.ci.name} (${run.change_number}) ended with no incidents. ` +
         `An authorised person must now confirm the delete: "decom confirm ${run.id}", or cancel with "decom cancel ${run.id}".` +
-        (config.dryRun ? ' (Dry run: confirming will not delete the VM.)' : ''));
+        (run.dry_run ? ' (Dry run: confirming will not delete the VM.)' : ''));
       return 'stop';
     },
 
@@ -358,7 +359,7 @@ function createEngine({ db, itsm, hypervisor, notifier, config, now = () => new 
         if (drift.length) { await needsAttention(run, `the VM no longer matches the CMDB record (${drift.join('; ')}), so it was not deleted.`); return 'stop'; }
         if (vm.powerState !== 'poweredOff') { await needsAttention(run, `${vm.name} is ${vm.powerState}: someone started it during the soak period, so it was not deleted.`); return 'stop'; }
         if (!run.reclaimed) await update(run.id, { reclaimed: vm.size || {} });
-        if (config.dryRun) {
+        if (run.dry_run) {
           await event(run.id, null, 'dry_run', `Dry run: ${vm.name} was not deleted.`);
         } else {
           await update(run.id, { destroy_issued_at: now() });
@@ -372,24 +373,23 @@ function createEngine({ db, itsm, hypervisor, notifier, config, now = () => new 
           }
         }
       }
-      if (!config.dryRun) await closeTaskOnce(run, DESTROY_TASK, `VM deleted by the decommission orchestrator, confirmed by ${run.destroy_confirmed_by}.`);
-      await transition(run, 'retiring', {}, config.dryRun ? 'Dry run: delete skipped.' : `${run.ci.name} deleted.`);
-      if (!config.dryRun) await notify(run.id, 'destroyed', `🗑️ ${run.ci.name} deleted from ${run.ci.host.name}.`);
+      if (!run.dry_run) await closeTaskOnce(run, DESTROY_TASK, `VM deleted by the decommission orchestrator, confirmed by ${run.destroy_confirmed_by}.`);
+      await transition(run, 'retiring', {}, run.dry_run ? 'Dry run: delete skipped.' : `${run.ci.name} deleted.`);
+      if (!run.dry_run) await notify(run.id, 'destroyed', `🗑️ ${run.ci.name} deleted from ${run.ci.host.name}.`);
       return 'continue';
     },
 
     async retiring(run) {
       const fresh = await getRun(run.id);
       const reclaimed = sizeText(fresh.reclaimed);
-      if (config.dryRun) {
-        // A rehearsal leaves everything as it was: VM back on, CI status back, change closed with a note.
-        const vm = await hypervisor.findVm({ host: run.ci.host, name: run.ci.name, uuid: run.ci.uuid });
-        if (vm && vm.powerState === 'poweredOff') await hypervisor.powerOn(vm, { host: run.ci.host });
-        if (run.ci_status_before) await once(`run:${run.id}:ci:restore`, () => itsm.setCiStatus(run.ci, run.ci_status_before).then(() => true));
-        await workNoteOnce(run, 'dry-run', `Dry run finished: ${run.ci.name} was not deleted and has been powered back on; CI status restored. Would have reclaimed ${reclaimed}.`);
+      if (run.dry_run) {
+        // A rehearsal leaves everything as it was: the VM's power state, the CI status, change closed with a note.
+        const power = await restorePower(run);
+        if (hasStatusBefore(run)) await once(`run:${run.id}:ci:restore`, () => itsm.setCiStatus(run.ci, run.ci_status_before).then(() => true));
+        await workNoteOnce(run, 'dry-run', `Dry run finished: ${run.ci.name} was not deleted; ${power}; CI status restored. Would have reclaimed ${reclaimed}.`);
         await once(`run:${run.id}:change:closed`, () => itsm.setChangeState(run.change_sys_id, 'closed', 'Dry run of the decommission workflow; no VM was deleted.').then(() => true));
-        await transition(run, 'completed', { outcome: `Dry run completed; ${run.ci.name} powered back on, nothing deleted.` });
-        await notify(run.id, 'summary', `🧪 Dry run of ${run.ci.name} (${run.change_number}) finished. Nothing was deleted; the VM is back on. Would have reclaimed: ${reclaimed}.`);
+        await transition(run, 'completed', { outcome: `Dry run completed; nothing deleted; ${power}.` });
+        await notify(run.id, 'summary', `🧪 Dry run of ${run.ci.name} (${run.change_number}) finished. Nothing was deleted; ${power}. Would have reclaimed: ${reclaimed}.`);
         return 'stop';
       }
       await once(`run:${run.id}:ci:retired`, () => itsm.setCiStatus(run.ci, 'retired').then(() => true));
@@ -406,40 +406,51 @@ function createEngine({ db, itsm, hypervisor, notifier, config, now = () => new 
 
     async cancelling(run) {
       const notes = [];
-      if (run.powered_off_at && !run.destroy_issued_at && run.ci) {
-        const vm = await hypervisor.findVm({ host: run.ci.host, name: run.ci.name, uuid: run.ci.uuid });
-        if (vm && vm.powerState === 'poweredOff') {
-          await once(`run:${run.id}:vm:power-on`, () => hypervisor.powerOn(vm, { host: run.ci.host }).then(() => true));
-          notes.push(`${vm.name} powered back on`);
-        }
-      }
-      if (run.ci_status_before && run.ci) {
+      if (run.powered_off_at && !run.destroy_issued_at && run.ci) notes.push(await restorePower(run));
+      if (hasStatusBefore(run) && run.ci) {
         const current = await itsm.getCiStatus(run.ci);
-        if (current === 'in_maintenance') { await itsm.setCiStatus(run.ci, run.ci_status_before); notes.push(`CI back to ${run.ci_status_before.replace(/_/g, ' ')}`); }
+        if (current === 'in_maintenance') { await itsm.setCiStatus(run.ci, run.ci_status_before); notes.push(`CI back to ${run.ci_status_before.replace(/_/g, ' ') || 'no status'}`); }
       }
-      if (run.change_sys_id) {
-        const change = await itsm.getChange(run.change_sys_id);
+      // A cancel can win the race with change creation, before the run has recorded the change: find it
+      // by its correlation ID so it is not left open in ServiceNow.
+      let changeSysId = run.change_sys_id;
+      if (!changeSysId && run.ci) {
+        const found = await itsm.findChange(`decom-orchestrator-run-${run.id}`);
+        if (found) { changeSysId = found.sysId; await update(run.id, { change_sys_id: found.sysId, change_number: found.number }); }
+      }
+      if (changeSysId) {
+        const change = await itsm.getChange(changeSysId);
         if (!['cancelled', 'closed', 'rejected'].includes(change.status)) {
-          await itsm.setChangeState(run.change_sys_id, 'cancelled', `Decommission cancelled. ${run.outcome || ''}`.trim());
+          await itsm.setChangeState(changeSysId, 'cancelled', `Decommission cancelled. ${run.outcome || ''}`.trim());
         }
       }
       const outcome = `${run.outcome || 'Cancelled.'}${notes.length ? ` ${sentence(notes.join('; '))}` : ''}`;
-      await transition(run, 'cancelled', { outcome });
-      await notify(run.id, 'cancelled', `🛑 Decommission of ${ciLabel(run)}${run.change_number ? ` (${run.change_number})` : ''} cancelled. ${outcome}`);
+      const done = await transition(run, 'cancelled', { outcome });
+      await notify(run.id, 'cancelled', `🛑 Decommission of ${ciLabel(run)}${done.change_number ? ` (${done.change_number})` : ''} cancelled. ${outcome}`);
       return 'stop';
     },
 
     async on_hold() { return 'stop'; },
   };
 
+  // Put the VM back in the power state it had when the request was validated: powered on only if it
+  // was on then. A VM that was already off (or suspended) stays off. Returns words for the messages.
+  async function restorePower(run) {
+    const before = run.vm && run.vm.powerState;
+    const vm = await hypervisor.findVm({ host: run.ci.host, name: run.ci.name, uuid: run.ci.uuid });
+    if (!vm) return 'the VM was not found to power it back on';
+    if (before !== 'poweredOn') return `the VM was left ${vm.powerState === 'poweredOff' ? 'off' : vm.powerState}, as it was ${before === 'suspended' ? 'suspended' : 'off'} before the decommission`;
+    if (vm.powerState === 'poweredOff') await hypervisor.powerOn(vm, { host: run.ci.host });
+    return 'the VM was powered back on';
+  }
+
   // An incident against the CI after the power-off puts the VM back on and holds the run for a person.
   async function incidentHold(run) {
     const incidents = await itsm.incidentsSince(run.ci, new Date(run.powered_off_at));
     if (!incidents.length) return false;
     const numbers = incidents.map((i) => i.number).join(', ');
-    const vm = await hypervisor.findVm({ host: run.ci.host, name: run.ci.name, uuid: run.ci.uuid });
-    if (vm && vm.powerState === 'poweredOff') await hypervisor.powerOn(vm, { host: run.ci.host });
-    const msg = `${numbers} raised against ${run.ci.name} during the soak period; the VM was powered back on.`;
+    const power = await restorePower(run);
+    const msg = `${numbers} raised against ${run.ci.name} during the soak period; ${power}.`;
     await transition(run, 'on_hold', { attention: msg }, msg);
     await workNoteOnce(run, `hold:${numbers}`, `${msg} The decommission is on hold.`);
     await notify(run.id, `hold:${numbers}`, `⏸️ ${msg} The decommission is on hold: "decom retry ${run.id}" powers it off again and restarts the soak period, "decom cancel ${run.id}" cancels it.`);
@@ -487,26 +498,50 @@ function createEngine({ db, itsm, hypervisor, notifier, config, now = () => new 
 
   const kick = (runId) => { if (autoKick) setImmediate(() => { advance(runId).catch(() => {}); }); };
 
-  // Every due run, then every message waiting for delivery. Called on a timer and at startup, which is
-  // also how interrupted runs resume.
-  async function tick() {
+  // Every due run. Called on a timer and at startup, which is also how interrupted runs resume. Runs
+  // advance side by side (up to MAX_PARALLEL), so a long VM step in one run never holds up the others;
+  // the service calls it with { wait: false }, the tests wait for the runs it started.
+  const MAX_PARALLEL = 4;
+  async function tick({ wait = true } = {}) {
     const { rows } = await db.query(`SELECT id FROM decom_runs WHERE state <> ALL($1) AND attention IS NULL AND next_check_at <= $2 ORDER BY id`, [FINAL, now()]);
-    for (const r of rows) await advance(r.id);
-    await deliver();
+    const started = [];
+    for (const r of rows) {
+      if (busy.has(r.id)) continue;
+      if (busy.size >= MAX_PARALLEL) break; // the rest on the next tick
+      started.push(advance(r.id));
+    }
+    if (wait) await Promise.all(started);
+    if (wait) await deliver();
   }
 
+  // Messages go out in order. A message the chat system refuses for good (a 4xx other than 408/429, or
+  // OUTBOX_MAX_ATTEMPTS failures) is set aside as 'failed' so it cannot block every later message.
+  const OUTBOX_MAX_ATTEMPTS = 10;
+  let delivering = false;
   async function deliver() {
-    const { rows } = await db.query(`SELECT * FROM outbox WHERE status = 'pending' AND next_try_at <= $1 ORDER BY id LIMIT 50`, [now()]);
-    for (const m of rows) {
-      try {
-        await notifier.send({ runId: m.run_id, key: m.key, message: m.message, data: m.data });
-        await db.query(`UPDATE outbox SET status = 'sent', sent_at = $2, attempts = attempts + 1 WHERE id = $1`, [m.id, now()]);
-      } catch (e) {
-        const wait = Math.min(600, 5 * 2 ** Math.min(m.attempts, 7));
-        await db.query('UPDATE outbox SET attempts = attempts + 1, last_error = $2, next_try_at = $3 WHERE id = $1',
-          [m.id, String(e.message).slice(0, 500), new Date(now().getTime() + wait * 1000)]);
-        break; // keep messages in order: the rest wait for this one
+    if (delivering) return;
+    delivering = true;
+    try {
+      const { rows } = await db.query(`SELECT * FROM outbox WHERE status = 'pending' AND next_try_at <= $1 ORDER BY id LIMIT 50`, [now()]);
+      for (const m of rows) {
+        try {
+          await notifier.send({ runId: m.run_id, key: m.key, message: m.message, data: m.data });
+          await db.query(`UPDATE outbox SET status = 'sent', sent_at = $2, attempts = attempts + 1 WHERE id = $1`, [m.id, now()]);
+        } catch (e) {
+          const error = String(e.message).slice(0, 500);
+          if (e.permanent || m.attempts + 1 >= OUTBOX_MAX_ATTEMPTS) {
+            await db.query(`UPDATE outbox SET status = 'failed', attempts = attempts + 1, last_error = $2 WHERE id = $1`, [m.id, error]);
+            if (m.run_id) await event(m.run_id, null, 'warning', `A chat message could not be delivered and was set aside (${error}): ${m.message}`);
+            continue;
+          }
+          const wait = Math.min(600, 5 * 2 ** Math.min(m.attempts, 7));
+          await db.query('UPDATE outbox SET attempts = attempts + 1, last_error = $2, next_try_at = $3 WHERE id = $1',
+            [m.id, error, new Date(now().getTime() + wait * 1000)]);
+          break; // keep messages in order: the rest wait for this one
+        }
       }
+    } finally {
+      delivering = false;
     }
   }
 
@@ -529,8 +564,8 @@ function createEngine({ db, itsm, hypervisor, notifier, config, now = () => new 
     if (isNeverTouch(name)) throw new DecomError(422, `${name} is on the never-touch list.`);
     let run;
     try {
-      ({ rows: [run] } = await db.query(`INSERT INTO decom_runs (server, state, requested_by, created_at, updated_at, next_check_at)
-        VALUES ($1, 'validating', $2, $3, $3, $3) RETURNING *`, [name, who, now()]));
+      ({ rows: [run] } = await db.query(`INSERT INTO decom_runs (server, state, requested_by, dry_run, created_at, updated_at, next_check_at)
+        VALUES ($1, 'validating', $2, $4, $3, $3, $3) RETURNING *`, [name, who, now(), !!config.dryRun]));
     } catch (e) {
       if (/decom_runs_one_active|duplicate key/.test(e.message)) {
         const { rows } = await db.query(`SELECT id, state FROM decom_runs WHERE lower(server) = lower($1) AND state <> ALL($2)`, [name, FINAL]);
@@ -539,7 +574,7 @@ function createEngine({ db, itsm, hypervisor, notifier, config, now = () => new 
       throw e;
     }
     await event(run.id, who, 'request', `${who} asked to decommission ${name}.`);
-    await notify(run.id, 'received', `📥 Request received from ${who}: decommission ${name} (run ${run.id}). Checking the CMDB and vSphere.`);
+    await notify(run.id, 'received', `📥 Request received from ${who}: decommission ${name} (run ${run.id}${run.dry_run ? ', dry run' : ''}). Checking the CMDB and vSphere.`);
     kick(run.id);
     return run;
   }
