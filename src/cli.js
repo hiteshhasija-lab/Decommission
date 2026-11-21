@@ -146,7 +146,7 @@ async function main() {
         console.log('vSphere: not configured (VSPHERE_USER, VSPHERE_PASSWORD).');
       } else {
         try {
-          console.log(`vSphere: ${(await hypervisor.about({ ip: hostIp, name: hostIp })).split('\n')[0]}`);
+          console.log(`vSphere: ${await hypervisor.about({ ip: hostIp, name: hostIp })}.`);
         } catch (e) { console.log(`vSphere: FAILED — ${e.message}`); }
       }
       break;

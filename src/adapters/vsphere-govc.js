@@ -139,9 +139,12 @@ function createVsphere(cfg, { exec = execFile } = {}) {
     if (left.includes(vm.ref)) throw new Error(`${vm.name} is still there after the delete.`);
   }
 
-  // Read-only connection check for `decom check`.
+  // Read-only connection check for `decom check`. `about` answers without a login, so the VM count
+  // (which needs one) is what proves the credentials work.
   async function about(host) {
-    return (await govc(host, ['about'])).trim();
+    const name = (await govc(host, ['about'])).split('\n')[0].replace(/^FullName:\s*/, '').trim();
+    const vms = (await govc(host, ['find', '/', '-type', 'm'])).split('\n').filter(Boolean).length;
+    return `${name}; logged in, ${vms} VM${vms === 1 ? '' : 's'} visible`;
   }
 
   return { findVm, shutdown, powerOn, destroy, about, _toVm: toVm };

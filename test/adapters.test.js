@@ -127,3 +127,10 @@ test('vSphere: hosts outside VSPHERE_ALLOWED_HOSTS are refused', async () => {
   const c = load({ VSPHERE_USER: 'u', VSPHERE_PASSWORD: 'p', VSPHERE_ALLOWED_HOSTS: '10.0.0.65' });
   await assert.rejects(createVsphere(c, { exec: fakeExec({}) }).findVm({ host: { ip: '10.0.0.66' }, name: 'X' }), /not in VSPHERE_ALLOWED_HOSTS/);
 });
+
+test('vSphere: the connection check proves the login with a VM count', async () => {
+  const exec = fakeExec({ about: 'FullName:     VMware ESXi 7.0.2 build-17867351\nName: VMware ESXi\n', find: '/dc/vm/A\n/dc/vm/B\n' });
+  assert.equal(await createVsphere(cfg, { exec }).about({ ip: '10.0.0.65' }), 'VMware ESXi 7.0.2 build-17867351; logged in, 2 VMs visible');
+  const bad = fakeExec({ about: 'FullName: x\n', find: new Error('ServerFaultCode: Cannot complete login due to an incorrect user name or password.') });
+  await assert.rejects(createVsphere(cfg, { exec: bad }).about({ ip: '10.0.0.65' }), /incorrect user name or password/);
+});
